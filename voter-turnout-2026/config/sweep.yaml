@@ -1,0 +1,31 @@
+program: src/sweep.py
+method: bayes
+metric:
+  name: val/pr_auc
+  goal: maximize
+early_terminate:
+  type: hyperband
+  min_iter: 50
+parameters:
+  n_estimators:
+    distribution: int_uniform
+    min: 100
+    max: 600
+  max_depth:
+    values: [4, 5, 6, 7, 8]
+  learning_rate:
+    distribution: log_uniform_values
+    min: 0.01
+    max: 0.3
+  subsample:
+    distribution: uniform
+    min: 0.6
+    max: 1.0
+  colsample_bytree:
+    distribution: uniform
+    min: 0.5
+    max: 1.0
+  scale_pos_weight:
+    distribution: uniform
+    min: 1.5
+    max: 4.0
