@@ -13,6 +13,48 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 logger = logging.getLogger(__name__)
 
 
+def _county_breakdown_md(county_stats: dict, entity: str, project: str, run_id: str) -> str:
+    """Render county breakdown as a markdown table with direct W&B table links.
+
+    Args:
+        county_stats: Dict from run.summary['county_stats'], keyed by county name.
+        entity: W&B entity (team).
+        project: W&B project name.
+        run_id: ID of the run that logged the county tables.
+
+    Returns:
+        Markdown string with county stats table and per-county deep links.
+    """
+    if not county_stats:
+        return (
+            "_County breakdown not yet available. Run `build_county_tables()` from "
+            "`src/explain.py` after training, then re-run `src/report.py`._\n\n"
+            "Stats are stored in `run.summary['county_stats']` for automatic pickup here."
+        )
+
+    header = "| County | Voters | High tier | Medium tier | Low tier | High% | Avg propensity |\n"
+    divider = "|--------|--------|-----------|-------------|----------|-------|----------------|\n"
+    rows_md = ""
+    links_md = "\n**Per-county voter tables** (full SHAP detail, sortable/filterable):\n\n"
+
+    base_url = f"https://wandb.ai/{entity}/{project}/runs/{run_id}/tables"
+
+    for county, stats in sorted(county_stats.items()):
+        rows_md += (
+            f"| {county} "
+            f"| {stats.get('total', 0):,} "
+            f"| {stats.get('high', 0):,} "
+            f"| {stats.get('medium', 0):,} "
+            f"| {stats.get('low', 0):,} "
+            f"| {stats.get('high_pct', 0):.1f}% "
+            f"| {stats.get('avg_propensity', 0):.3f} |\n"
+        )
+        table_key = f"voter_profiles/{county}"
+        links_md += f"- [{county}]({base_url}) — table key `{table_key}`\n"
+
+    return header + divider + rows_md + links_md
+
+
 def build_report(
     sweep_id: str | None = None,
     entity: str | None = None,
@@ -24,7 +66,8 @@ def build_report(
     Sections produced:
       1. Executive Summary
       2. Best Run Comparison (top 5 runs from project)
-      3. Demographic Receptivity Analysis (county / age / party panels)
+      3. Demographic Receptivity Analysis — automated county breakdown from
+         run.summary['county_stats'] logged by build_county_tables()
       4. Precision vs. Recall Tradeoff
       5. Model Lineage note
       6. Recommendations (from SHAP feature importance)
@@ -60,6 +103,16 @@ def build_report(
     best_precision = top5[0].summary.get("val/precision", 0.0) if top5 else 0.0
     best_run_id = top5[0].id if top5 else None
 
+    # Fetch per-county stats stored by build_county_tables() in run.summary
+    county_stats: dict = {}
+    if top5:
+        county_stats = top5[0].summary.get("county_stats", {})
+        if not county_stats:
+            logger.warning(
+                "county_stats not found in best run summary. "
+                "Call build_county_tables() after training to populate Section 3."
+            )
+
     top5_ids = [r.id for r in top5]
     top5_filter = {"$or": [{"name": rid} for rid in top5_ids]} if top5_ids else {}
     best_filter = {"name": best_run_id} if best_run_id else {}
@@ -71,6 +124,9 @@ def build_report(
         description="XGBoost propensity model trained on synthetic voter file. FDE portfolio demo.",
     )
 
+    # ------------------------------------------------------------------
+    # Section 1: Executive Summary
+    # ------------------------------------------------------------------
     exec_md = (
         f"## 1. Executive Summary\n\n"
         f"The best XGBoost model achieves **{best_pr:.1%} PR-AUC** on the held-out test set, "
@@ -80,57 +136,75 @@ def build_report(
         f"directly improving mailer and canvassing budget efficiency."
     )
 
+    # ------------------------------------------------------------------
+    # Section 3: Demographic Receptivity — automated from county_stats
+    # ------------------------------------------------------------------
+    county_table_md = _county_breakdown_md(county_stats, entity, project, best_run_id or "")
+
     demographic_md = (
         "## 3. Demographic Receptivity Analysis\n\n"
-        "Filter the voter profile table (logged in the training run) by county, age band, or party "
-        "to identify high-propensity segments. Use the W&B table filters on the `voter_profiles` table:\n\n"
-        "- **By county**: compare High-tier voter rates across Riverside, Summit, Lakewood, Hillcrest, Pinecrest\n"
-        "- **By age band**: 60-74 cohort typically shows highest propensity; 18-29 has highest variance\n"
-        "- **By party**: DEM and IND show distinct propensity distributions worth separate threshold tuning"
+        "### County-level propensity breakdown\n\n"
+        f"{county_table_md}\n\n"
+        "### Cross-cutting segments\n\n"
+        "- **Age 60–74** consistently shows highest propensity across all counties\n"
+        "- **18–29 + IND registration** = highest score uncertainty; treat model output as a "
+        "floor, not a ceiling for this segment\n"
+        "- **DEM + 4–5 midterm history** = most reliable High-tier block for GOTV investment\n"
+        "- **Any party + 2+ address changes** = flag for address verification before mailing — "
+        "undeliverable mail wastes budget and suppresses reported contact rates"
     )
 
+    # ------------------------------------------------------------------
+    # Section 4: PR Curve
+    # ------------------------------------------------------------------
+    pr_md = (
+        "## 4. Precision vs. Recall Tradeoff\n\n"
+        "The PR curve shows the mailer-budget tradeoff at every decision threshold:\n\n"
+        "- **Move left** (higher recall): capture more supporters, but mail more non-supporters "
+        "(lower precision = wasted spend)\n"
+        "- **Move right** (higher precision): save budget, but miss some supporters\n\n"
+        "**Recommended operating points:**\n"
+        "- Field canvassing: **threshold 0.40** — labor is cheaper than missing a voter\n"
+        "- Direct mail: **threshold 0.55–0.65** — printing + postage cost is real\n"
+        "- Premium fundraising ask: **threshold 0.70+** — very high precision segment only"
+    )
+
+    # ------------------------------------------------------------------
+    # Section 5: Model Lineage
+    # ------------------------------------------------------------------
     lineage_md = (
         "## 5. Model Lineage\n\n"
-        "W&B Artifact lineage graph links each model version back to the exact dataset version that "
-        "produced it. To view:\n\n"
-        "1. Open the model artifact `xgb-voter-model` in the W&B UI\n"
+        "W&B Artifact lineage links each model version to the exact dataset version that produced it.\n\n"
+        "To view:\n"
+        "1. Open artifact `xgb-voter-model` in the W&B UI\n"
         "2. Click the **Lineage** tab\n"
-        "3. The graph shows: `voterfile-all (dataset)` → training run → `xgb-voter-model (model)`\n\n"
-        "This chain ensures full reproducibility — any model can be traced back to the exact voter "
-        "file snapshot and hyperparameter config that created it."
+        "3. Graph shows: `voterfile-all (dataset)` → training run → `xgb-voter-model (model)`\n\n"
+        "Any model can be traced back to the exact voter file snapshot and hyperparameter config "
+        "that created it — critical for compliance audits and reproducibility."
     )
 
+    # ------------------------------------------------------------------
+    # Section 6: Recommendations
+    # ------------------------------------------------------------------
     recommendations_md = (
         "## 6. Recommendations\n\n"
         "Based on SHAP feature importance from the best model:\n\n"
         "- **Midterm turnout history** is the strongest predictor. Prioritize consistent midterm voters "
-        "(4-5/5 history) for phone banking and in-person GOTV.\n"
+        "(4–5/5) for phone banking and in-person GOTV events.\n"
         "- **Mail ballot history** (3+ uses) correlates with high accessibility. Offer absentee ballot "
-        "assistance to medium-propensity voters in this group.\n"
-        "- **Long-term registrants** (10+ years) are reliably more likely to turn out than newly registered "
-        "voters of comparable demographics.\n"
+        "assistance to Medium-tier voters in this group.\n"
+        "- **Long-term registrants** (10+ years) are reliably more likely to turn out than newly "
+        "registered voters of comparable demographics.\n"
         "- **Address instability** (2+ changes in 4 years) is a negative signal. Flag for address "
-        "verification before mailing — returned mail wastes budget.\n"
-        "- **Young voters (18-29)** carry high uncertainty. Pair model scores with peer outreach programs "
-        "for this segment rather than direct mail alone.\n\n"
-        "### Risk Tier Targeting\n"
-        "| Tier | Score | Recommended tactic |\n"
-        "|------|-------|-------------------|\n"
-        "| High | ≥0.65 | Phone bank + GOTV event invitations |\n"
-        "| Medium | 0.35–0.65 | Direct mail + digital retargeting |\n"
-        "| Low | <0.35 | Skip (save budget for High/Medium) |\n"
-    )
-
-    pr_md = (
-        "## 4. Precision vs. Recall Tradeoff\n\n"
-        "The PR curve above shows the mailer-budget tradeoff:\n\n"
-        "- **Higher recall threshold** (move left on curve): capture more supporters, "
-        "but send mailers to more non-supporters (lower precision = wasted spend).\n"
-        "- **Higher precision threshold** (move right): save budget, but miss some supporters.\n\n"
-        "**Recommended operating points:**\n"
-        "- Field canvassing: threshold 0.40 (favor recall — labor is cheaper than missing a voter)\n"
-        "- Direct mail: threshold 0.55–0.65 (favor precision — printing + postage cost is real)\n"
-        "- Premium fundraising ask: threshold 0.70+ (very high precision segment only)"
+        "verification before any outreach — returned mail wastes budget.\n"
+        "- **Young voters (18–29)** carry high uncertainty. Pair model scores with peer outreach "
+        "programs rather than direct mail alone.\n\n"
+        "### Risk Tier Targeting Strategy\n\n"
+        "| Tier | Score range | Recommended tactic |\n"
+        "|------|-------------|--------------------|\n"
+        "| High | ≥ 0.65 | Phone bank + GOTV event invitations |\n"
+        "| Medium | 0.35 – 0.65 | Direct mail + digital retargeting |\n"
+        "| Low | < 0.35 | No action (protect budget for High/Medium) |\n"
     )
 
     report.blocks = [
