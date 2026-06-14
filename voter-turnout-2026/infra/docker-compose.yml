@@ -1,0 +1,12 @@
+version: "3.7"
+services:
+  wandb-local:
+    image: wandb/local:latest
+    ports:
+      - "8080:8080"
+    environment:
+      - LOCAL_RESTORE=true
+    volumes:
+      - wandb-data:/vol
+volumes:
+  wandb-data:
