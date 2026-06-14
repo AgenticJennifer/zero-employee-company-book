@@ -1,0 +1,29 @@
+# Voter files contain PII — never commit raw data
+data/raw/*
+!data/raw/.gitkeep
+data/processed/*
+!data/processed/.gitkeep
+
+# Secrets
+.env
+.env.local
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+env/
+
+# W&B local run cache
+wandb/
+
+# Generated outputs
+outputs/
+
+# OS
+.DS_Store
+*.swp
