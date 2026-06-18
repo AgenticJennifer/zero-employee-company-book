@@ -280,3 +280,53 @@ def build_county_tables(
     run.summary.update({"county_stats": county_stats})
     logger.info("Logged county_summary table and voter_profiles/{county} for %d counties", len(county_tables))
     return county_tables
+
+
+if __name__ == "__main__":
+    import argparse
+    import os
+    from pathlib import Path
+
+    from dotenv import load_dotenv
+
+    from src.artifacts import load_model_artifact
+    from src.features import split_features
+    from src.ingest import load_voter_file
+
+    load_dotenv()
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+
+    parser = argparse.ArgumentParser(
+        description="Retroactively build voter profile and county tables for an existing W&B run."
+    )
+    parser.add_argument("--run-id", required=True, help="W&B run ID to attach tables to")
+    parser.add_argument("--entity", default=None, help="W&B entity (defaults to WANDB_ENTITY env var)")
+    parser.add_argument("--project", default=None, help="W&B project (defaults to WANDB_PROJECT env var)")
+    parser.add_argument("--max-rows-per-county", type=int, default=1000)
+    args = parser.parse_args()
+
+    entity = args.entity or os.environ.get("WANDB_ENTITY")
+    project = args.project or os.environ.get("WANDB_PROJECT", "voter-turnout-2026")
+
+    # Resume the existing run so tables appear on the same run page
+    run = wandb.init(
+        id=args.run_id,
+        project=project,
+        entity=entity,
+        resume="must",
+    )
+
+    model, _ = load_model_artifact(run)
+
+    data_path = Path(os.environ.get("DATA_PATH", "data/synthetic")) / "voters.csv"
+    df, _ = load_voter_file(data_path)
+
+    _, _, X_test, _, _, _ = split_features(df)
+    voter_meta_test = df.loc[X_test.index].reset_index(drop=True)
+    X_test_reset = X_test.reset_index(drop=True)
+
+    build_voter_table(model, X_test_reset, voter_meta_test, run)
+    build_county_tables(model, X_test_reset, voter_meta_test, run, max_rows_per_county=args.max_rows_per_county)
+
+    run.finish()
+    logger.info("Done. Tables attached to run %s/%s/%s", entity, project, args.run_id)
