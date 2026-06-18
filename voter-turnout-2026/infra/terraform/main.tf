@@ -1,17 +1,25 @@
-# [DECISION NEEDED: AWS or Azure?]
-# This file is a stub. Fill in the chosen provider block below,
-# then delete the other. Run `terraform init` after deciding.
+# AWS provider activated.
+# To switch to Azure: comment out everything between the AWS markers below
+# and uncomment the AZURE OPTION block at the bottom of this file.
 #
-# AWS option  → uncomment the aws provider block and resources below
-# Azure option → uncomment the azurerm provider block and resources below
+# Before running:
+#   1. Replace allowed_office_cidrs default with real campaign office IPs
+#   2. Set your AWS region (default: us-east-1)
+#   3. Update the AMI ID to the latest Amazon Linux 2 in your region
+#   4. Run: terraform init && terraform plan
 
 # -------------------------------------------------------------------
-# VARIABLES (shared across both providers)
+# VARIABLES
 # -------------------------------------------------------------------
 variable "allowed_office_cidrs" {
   type        = list(string)
-  description = "Campaign office IP CIDRs allowed to reach the W&B server."
-  default     = ["10.0.0.0/8"] # [DECISION NEEDED: replace with real office IPs]
+  description = "Campaign office IP CIDRs allowed inbound to the W&B server on port 8080."
+  default     = ["10.0.0.0/8"] # TODO: replace with real office IPs before apply
+}
+
+variable "aws_region" {
+  type    = string
+  default = "us-east-1"
 }
 
 variable "environment" {
@@ -20,82 +28,139 @@ variable "environment" {
 }
 
 # -------------------------------------------------------------------
-# AWS OPTION
-# Provisions: VPC + private subnet, EC2 for W&B Server, S3 artifact
-# backend, security group restricted to campaign office IPs.
+# AWS OPTION (active)
+# Provisions: VPC + private subnet, EC2 t3.medium for W&B Server,
+# S3 artifact backend with versioning, SG restricted to office IPs.
 # -------------------------------------------------------------------
-# Uncomment to use:
 
-# provider "aws" {
-#   region = "us-east-1" # [DECISION NEEDED: set your region]
-# }
-#
-# resource "aws_vpc" "main" {
-#   cidr_block           = "10.0.0.0/16"
-#   enable_dns_hostnames = true
-#   tags = { Name = "voter-turnout-vpc" }
-# }
-#
-# resource "aws_subnet" "private" {
-#   vpc_id            = aws_vpc.main.id
-#   cidr_block        = "10.0.1.0/24"
-#   availability_zone = "us-east-1a"
-#   tags = { Name = "voter-turnout-private" }
-# }
-#
-# resource "aws_security_group" "wandb" {
-#   name   = "wandb-server-sg"
-#   vpc_id = aws_vpc.main.id
-#
-#   ingress {
-#     from_port   = 8080
-#     to_port     = 8080
-#     protocol    = "tcp"
-#     cidr_blocks = var.allowed_office_cidrs
-#   }
-#
-#   egress {
-#     from_port   = 0
-#     to_port     = 0
-#     protocol    = "-1"
-#     cidr_blocks = ["0.0.0.0/0"]
-#   }
-# }
-#
-# resource "aws_instance" "wandb" {
-#   ami                    = "ami-0c55b159cbfafe1f0" # [DECISION NEEDED: use latest Amazon Linux 2]
-#   instance_type          = "t3.medium"
-#   subnet_id              = aws_subnet.private.id
-#   vpc_security_group_ids = [aws_security_group.wandb.id]
-#
-#   user_data = <<-EOF
-#     #!/bin/bash
-#     docker pull wandb/local
-#     docker run -d -p 8080:8080 -v /vol:/vol -e LOCAL_RESTORE=true wandb/local
-#   EOF
-#
-#   tags = { Name = "wandb-server" }
-# }
-#
-# resource "aws_s3_bucket" "artifacts" {
-#   bucket = "voter-turnout-wandb-artifacts-${var.environment}"
-# }
-#
-# resource "aws_s3_bucket_versioning" "artifacts" {
-#   bucket = aws_s3_bucket.artifacts.id
-#   versioning_configuration { status = "Enabled" }
-# }
-#
-# output "wandb_server_url" {
-#   value = "http://${aws_instance.wandb.private_ip}:8080"
-# }
+provider "aws" {
+  region = var.aws_region
+}
+
+resource "aws_vpc" "main" {
+  cidr_block           = "10.0.0.0/16"
+  enable_dns_hostnames = true
+  tags = {
+    Name        = "voter-turnout-vpc"
+    Environment = var.environment
+  }
+}
+
+resource "aws_subnet" "private" {
+  vpc_id            = aws_vpc.main.id
+  cidr_block        = "10.0.1.0/24"
+  availability_zone = "${var.aws_region}a"
+  tags = {
+    Name        = "voter-turnout-private"
+    Environment = var.environment
+  }
+}
+
+resource "aws_internet_gateway" "main" {
+  vpc_id = aws_vpc.main.id
+  tags   = { Name = "voter-turnout-igw" }
+}
+
+resource "aws_security_group" "wandb" {
+  name        = "wandb-server-sg"
+  description = "Allow W&B traffic from campaign office IPs only"
+  vpc_id      = aws_vpc.main.id
+
+  ingress {
+    description = "W&B Server UI from campaign offices"
+    from_port   = 8080
+    to_port     = 8080
+    protocol    = "tcp"
+    cidr_blocks = var.allowed_office_cidrs
+  }
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  tags = { Name = "wandb-server-sg", Environment = var.environment }
+}
+
+# TODO: replace ami with latest Amazon Linux 2 for your region
+# Find with: aws ec2 describe-images --owners amazon --filters "Name=name,Values=amzn2-ami-hvm-*-x86_64-gp2" --query 'sort_by(Images,&CreationDate)[-1].ImageId'
+resource "aws_instance" "wandb" {
+  ami                    = "ami-0c55b159cbfafe1f0"
+  instance_type          = "t3.medium"
+  subnet_id              = aws_subnet.private.id
+  vpc_security_group_ids = [aws_security_group.wandb.id]
+
+  root_block_device {
+    volume_size           = 50
+    volume_type           = "gp3"
+    encrypted             = true
+    delete_on_termination = true
+  }
+
+  user_data = <<-EOF
+    #!/bin/bash
+    yum update -y
+    amazon-linux-extras install docker -y
+    service docker start
+    usermod -a -G docker ec2-user
+    docker pull wandb/local
+    docker run -d \
+      -p 8080:8080 \
+      -v /vol:/vol \
+      -e LOCAL_RESTORE=true \
+      --restart unless-stopped \
+      wandb/local
+  EOF
+
+  tags = { Name = "wandb-server", Environment = var.environment }
+}
+
+resource "aws_s3_bucket" "artifacts" {
+  bucket = "voter-turnout-wandb-artifacts-${var.environment}"
+  tags   = { Environment = var.environment }
+}
+
+resource "aws_s3_bucket_versioning" "artifacts" {
+  bucket = aws_s3_bucket.artifacts.id
+  versioning_configuration { status = "Enabled" }
+}
+
+resource "aws_s3_bucket_server_side_encryption_configuration" "artifacts" {
+  bucket = aws_s3_bucket.artifacts.id
+  rule {
+    apply_server_side_encryption_by_default {
+      sse_algorithm = "AES256"
+    }
+  }
+}
+
+resource "aws_s3_bucket_public_access_block" "artifacts" {
+  bucket                  = aws_s3_bucket.artifacts.id
+  block_public_acls       = true
+  block_public_policy     = true
+  ignore_public_acls      = true
+  restrict_public_buckets = true
+}
+
+output "wandb_server_private_ip" {
+  value       = aws_instance.wandb.private_ip
+  description = "Set WANDB_BASE_URL=http://<this-ip>:8080 in your .env"
+}
+
+output "wandb_server_url" {
+  value = "http://${aws_instance.wandb.private_ip}:8080"
+}
+
+output "artifact_bucket" {
+  value = aws_s3_bucket.artifacts.id
+}
 
 # -------------------------------------------------------------------
-# AZURE OPTION
-# Provisions: VNet + private subnet, Linux VM for W&B Server,
-# Blob Storage artifact backend, NSG restricted to campaign office IPs.
+# AZURE OPTION (inactive — uncomment to use instead of AWS above)
+# Provisions: VNet + subnet, Linux VM, Blob Storage, NSG.
 # -------------------------------------------------------------------
-# Uncomment to use:
 
 # provider "azurerm" {
 #   features {}
@@ -103,7 +168,7 @@ variable "environment" {
 #
 # resource "azurerm_resource_group" "main" {
 #   name     = "voter-turnout-rg"
-#   location = "East US" # [DECISION NEEDED: set your region]
+#   location = "East US"
 # }
 #
 # resource "azurerm_virtual_network" "main" {
@@ -144,10 +209,8 @@ variable "environment" {
 #   location            = azurerm_resource_group.main.location
 #   size                = "Standard_B2s"
 #   admin_username      = "azureuser"
-#
-#   # [DECISION NEEDED: configure SSH public key or admin_password]
-#
-#   network_interface_ids = [] # wire to NIC referencing the subnet above
+#   # TODO: add admin_ssh_key or admin_password block
+#   network_interface_ids = [] # TODO: wire to NIC on the subnet above
 #
 #   os_disk {
 #     caching              = "ReadWrite"
@@ -164,7 +227,7 @@ variable "environment" {
 #   custom_data = base64encode(<<-EOF
 #     #!/bin/bash
 #     docker pull wandb/local
-#     docker run -d -p 8080:8080 -v /vol:/vol -e LOCAL_RESTORE=true wandb/local
+#     docker run -d -p 8080:8080 -v /vol:/vol -e LOCAL_RESTORE=true --restart unless-stopped wandb/local
 #   EOF
 #   )
 # }
@@ -175,8 +238,12 @@ variable "environment" {
 #   location                 = azurerm_resource_group.main.location
 #   account_tier             = "Standard"
 #   account_replication_type = "LRS"
+#
+#   blob_properties {
+#     versioning_enabled = true
+#   }
 # }
 #
 # output "wandb_server_url" {
-#   value = "http://<vm-private-ip>:8080" # replace after VM is provisioned
+#   value = "http://<vm-private-ip>:8080" # replace with actual IP after apply
 # }
