@@ -40,6 +40,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "random_seed": 42,
     "train_split": 0.8,
     "val_split": 0.1,
+    # False by default so sweep agents skip expensive SHAP; standalone `make train` sets True
+    "build_tables": False,
 }
 
 
@@ -83,7 +85,8 @@ def train(config: dict[str, Any] | None = None) -> None:
 
     Args:
         config: Hyperparameter overrides merged on top of DEFAULT_CONFIG.
-                Typically injected by a W&B sweep agent.
+                Pass ``{"build_tables": True}`` to also build SHAP voter profile
+                tables in the same run (skipped by default for sweep efficiency).
     """
     run_config = {**DEFAULT_CONFIG, **(config or {})}
 
@@ -158,6 +161,17 @@ def train(config: dict[str, Any] | None = None) -> None:
     val_meta = {k.replace("val/", ""): v for k, v in val_metrics.items()}
     log_model_artifact(run, model, FEATURE_COLUMNS, metadata=val_meta)
 
+    if cfg.get("build_tables", False):
+        from src.explain import build_county_tables, build_voter_table
+
+        # X_test preserves the original df index, so we can recover voter metadata rows
+        voter_meta_test = df.loc[X_test.index].reset_index(drop=True)
+        X_test_reset = X_test.reset_index(drop=True)
+
+        build_voter_table(model, X_test_reset, voter_meta_test, run)
+        build_county_tables(model, X_test_reset, voter_meta_test, run)
+        logger.info("Voter profile and county tables logged to run %s", run.id)
+
     logger.info(
         "Training complete | val/pr_auc=%.4f  test/pr_auc=%.4f",
         val_metrics["val/pr_auc"],
@@ -167,4 +181,14 @@ def train(config: dict[str, Any] | None = None) -> None:
 
 
 if __name__ == "__main__":
-    train()
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Train XGBoost voter propensity model")
+    parser.add_argument(
+        "--no-tables",
+        action="store_true",
+        help="Skip voter profile and county table building (faster, for quick iterations)",
+    )
+    args = parser.parse_args()
+
+    train(config={"build_tables": not args.no_tables})
