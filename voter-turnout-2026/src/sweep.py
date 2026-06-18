@@ -3,25 +3,29 @@
 import argparse
 import logging
 
-import wandb
 from dotenv import load_dotenv
 
-from src.train import DEFAULT_CONFIG, train
+from src.train import train
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 
 
-def sweep_train() -> None:
+def sweep_train(base_config: dict | None = None) -> None:
     """Entry point called by each W&B sweep agent worker.
 
-    wandb.init() is called inside train(); the sweep agent injects
-    hyperparameters via wandb.config before train() reads them.
+    The sweep agent runs this script as a subprocess and injects
+    hyperparameters via environment variables. train() calls wandb.init()
+    exactly once, picking those vars up automatically. Do NOT wrap this
+    in a second wandb.init() call — that would create a duplicate run.
+
+    Args:
+        base_config: Non-hyperparameter overrides merged into DEFAULT_CONFIG
+                     before the sweep agent's values take precedence
+                     (e.g. target column, build_tables flag).
     """
-    with wandb.init():
-        cfg = dict(wandb.config)
-        train(config=cfg)
+    train(config=base_config)
 
 
 if __name__ == "__main__":
@@ -37,14 +41,16 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
-    override: dict = {}
-    if args.target == "undecided":
-        # Filter to low-propensity voters as a proxy for undecided segment
-        override["target"] = "target_support"
-        override["undecided_only"] = True
-    elif args.target == "vote_propensity":
-        override["target"] = "target_vote_propensity"
-    else:
-        override["target"] = "target_support"
+    # Sweep agents skip SHAP table building — too expensive per trial.
+    # Run `make explain RUN_ID=<best-run-id>` once after the sweep to add tables.
+    base: dict = {"build_tables": False}
 
-    sweep_train()
+    if args.target == "undecided":
+        base["target"] = "target_support"
+        base["undecided_only"] = True
+    elif args.target == "vote_propensity":
+        base["target"] = "target_vote_propensity"
+    else:
+        base["target"] = "target_support"
+
+    sweep_train(base_config=base)
